@@ -1,261 +1,187 @@
-#include <CAN.h>
+/*
+
+Current ifs:
+
+___________________________________________________________________
+___________________________________________________________________
+___________CHANGE THE "p1" OBJECT ON PAGE 1 TO "warning"___________
+___________________________________________________________________
+
+
+- need to fix the cooling code, calculations, etc
+  - page1: p1.aph=127
+  - page2: idk, txt box plus objects???
+- need to understand the whole fuel thing
+- need to add the rest of the sensors for page 2
+
+*/
+#include <mcp_can.h>  // necessary for CAN Protocol communication commands
 #include <SPI.h>
-#define MISO_Pin 12
-#define MOSI_Pin 11
+
 #define CS_Pin 10
-#define SCK_Pin 13
-#define INTRPT_Pin 9
-float voltage;
-float coolTemp;
-float engnSpeed;
-float wheelSpeed;
-bool can_start = 1;
+#define INTRPT_Pin 9  // Interrupt pin
+
+struct CANMessage {
+  unsigned long id;
+  unsigned char len;
+  unsigned char buf[8];
+};
+
+#define BUFFER_SIZE 10  // Circular buffer size
+CANMessage canBuffer[BUFFER_SIZE];
+volatile int bufferHead = 0;
+volatile int bufferTail = 0;
+
+MCP_CAN CAN(CS_Pin);
+
+unsigned long last300Update = 0;  // 0.3 seconds
+unsigned long last1000Update = 0;  // 1.0 seconds
+unsigned long last5000Update = 0;  // 5.0 seconds
+const unsigned long interval300 = 300;
+const unsigned long interval1000 = 1000;
+const unsigned long interval5000 = 5000;
+
+unsigned int rpm, rpm1, rpm2, rpm3dig, gear, coolInTemp, coolOutTemp, batteryVoltage, fuelUsed;
+
+// Page Values
+const int pagePin = A9; // Analog pin for Page Dial
+unsigned int lastPage = -1;
+
 void setup() {
-  //establish SPI pins
-    // SPI.setMISO(MISO_Pin);
-    // SPI.setMOSI(MOSI_Pin);
-    // SPI.setSCK(SCK_Pin);
-  //Input output pins
   pinMode(CS_Pin, OUTPUT);
-  //Interrupt needs to read
   pinMode(INTRPT_Pin, INPUT);
-  //note: can library attaches its own interrupt to pin
-  //Configure CAN library:
-  CAN.setPins(CS_Pin, INTRPT_Pin); //
-  Serial.begin(9600);
   Serial1.begin(9600);
-  while (!Serial);
-  // // Serial.println("CAN Receiver Callback");
-  CAN.setSPIFrequency(100000); //max MCP is 10Mhz
-  CAN.setClockFrequency(8E6);
-  // start the CAN bus at 500 kbps
-  if (!CAN.begin(250E3)) {
-    // // Serial.println("Starting CAN failed!");
+
+  if (CAN.begin(MCP_ANY, CAN_250KBPS, MCP_8MHZ) == CAN_OK) {
+    attachInterrupt(digitalPinToInterrupt(INTRPT_Pin), canISR, FALLING);
+  } else {
     while (1);
-  } else {
-    // // Serial.println("CAN Started");
-    can_start = 0;
   }
-  // register the receive callback
-  CAN.onReceive(onReceive);
+
+  CAN.setMode(MCP_NORMAL);
+  delay(1000);
+
+  // assign testing page's data points
+  sendToNextion("nameB2", "Battery", false); sendToNextion("nameB3", "CoolIn", false); sendToNextion("nameB4", "CoolOut", false);
+  sendToNextion("nameC1", "FuelUsed", false); sendToNextion("nameC2", "", false); sendToNextion("nameC3", "", false); sendToNextion("nameC4", "", false);
+  sendToNextion("nameD1", "", false); sendToNextion("nameD2", "", false); sendToNextion("nameD3", "", false); sendToNextion("nameD4", "", false);
 }
+
 void loop() {
-  if (can_start){
-    while(!CAN.begin(250E3)){
-      // // Serial.println("can fail");
-      delay(100);
-    }
-  } else {
-    can_start = 0;
+  // Change Pages w/ dial
+  float pageVolt = analogRead(pagePin) * (3.3 / 1023.0); // from 0 to 1023 --> from 0.0 to 3.3
+  unsigned int currentPage = (pageVolt < 1.65) ? 0 : 1; // page0: <1.65  page2>=1.65
+  if (currentPage != lastPage) { 
+    Serial1.print("page" + String(currentPage)); Serial1.write(0xFF); Serial1.write(0xFF); Serial1.write(0xFF);
+    lastPage = currentPage;
   }
-  //print to dash
-  // RPM
-  int RPMVal = engnSpeed/100;
-  if (RPMVal <= 100) {
-    Serial1.print("p1.val=" + String(RPMVal)); Serial1.write(0xff); Serial1.write(0xff); Serial1.write(0xff);
-    Serial1.print("p2.val=0"); Serial1.write(0xff); Serial1.write(0xff); Serial1.write(0xff);
-  } else if (RPMVal > 100) {
-    int RPMP2 = (RPMVal % 100);
-    int RPMP1 = (RPMVal - RPMP2);
-    RPMP2 = (RPMP2 * 100) / 35;
-    Serial1.print("p1.val=" + String(RPMP1)); Serial1.write(0xff); Serial1.write(0xff); Serial1.write(0xff);
-    Serial1.print("p2.val=" + String(RPMP2)); Serial1.write(0xff); Serial1.write(0xff); Serial1.write(0xff);
-    // ONCE EVERYTHING COMPLETELY WORKS - CHANGE TOP CODE TO BELOW CODE (FASTER):
-      // NOTE: This will not work if the Arduino ends up recieving out-of-bound rpm values from MOTEC/CAN
-    //int RPMP2 = (RPMVal % 100) * 100 / 35;
-    //Serial.print("p1.val=100"); Serial.write(0xff); Serial.write(0xff); Serial.write(0xff);
-    //Serial.print("p2.val=" + String(RPMP2)); Serial.write(0xff); Serial.write(0xff); Serial.write(0xff);
+
+  processCANMessages();
+  unsigned long currentMillis = millis();
+  if (currentMillis - last300Update >= interval300) { // 300 - RPM, gear
+    sendRPM();
+    sendGear();
+    last300Update = currentMillis;
   }
-  // Coolant Temp
-  int CoolVal = coolTemp;
-  Serial1.print("coolant.val=" + String(CoolVal)); Serial1.write(0xff); Serial1.write(0xff); Serial1.write(0xff);
-  // Fan
-  String FanVal = "\"ON\""; // Options: "\"ON\"", "\"OFF\"" - maybe "\"AUTO\""
-  Serial1.print("fan.txt=" + FanVal); Serial1.write(0xff); Serial1.write(0xff); Serial1.write(0xff);
-  // Battery
-  Serial1.print("battery.val=" + String(voltage)); Serial1.write(0xff); Serial1.write(0xff); Serial1.write(0xff);
-  // Gear
-  String GearVal = "\"1\""; // Options: "\"N\"" or "\"i\"" where i = 0,1,2,3,4,5,6 - maybe not 0
-  Serial1.print("gear.txt=" + GearVal); Serial1.write(0xff); Serial1.write(0xff); Serial1.write(0xff);
-  // Traction Control
-  int TCVal = 0; // Options: 0 = OFF, 1 = ON
-  Serial1.print("tc.val=" + String(TCVal)); Serial1.write(0xff); Serial1.write(0xff); Serial1.write(0xff);
-  // Launch Control
-  int LCVal = 0; // Options: 0 = OFF, 1 = ON
-  Serial1.print("lc.val=" + String(LCVal)); Serial1.write(0xff); Serial1.write(0xff); Serial1.write(0xff);
-  Serial.print("Battery: " + String(voltage) + "V, \tCoolant Temp: " + String(coolTemp) + "C, \tEngine Speed: " + String(engnSpeed) + " RPM, \tWheel Speed: " + String(wheelSpeed) + "kph\n");
-  delay(100);
+  if (currentMillis - last1000Update >= interval1000) { // 1000 - coolant
+    sendCoolantTemp();
+    last1000Update = currentMillis;
+  }
+  if (currentMillis - last5000Update >= interval5000) { // 5000 - battery, fuel
+    sendBattery();
+    sendFuel();
+    last5000Update = currentMillis;
+  }
 }
-void onReceive(int packetSize) {
-  // received a packet
-  //// // Serial.println("hello");
-  // Serial.println(CAN.packetId());
-  if(CAN.packetId() == 0x701) {
-    // Serial.print("Received ");
-    if (CAN.packetExtended()) {
-      // Serial.print("extended ");
-    }
-    if (CAN.packetRtr()) {
-      // Remote transmission request, packet contains no data
-      // Serial.print("RTR ");
-    }
-    // Serial.print("packet with id ");
-    // Serial.print(CAN.packetId());
-    //// Serial.print(CAN.packetId(), HEX);
-    if (CAN.packetRtr()) {
-      // Serial.print(" and requested length ");
-      // Serial.println(CAN.packetDlc());
-    } else {
-      // Serial.print(" and length ");
-      // Serial.println(packetSize);
-      // only print packet data for non-RTR packets
-      union data {
-        uint32_t bits;
-        float number;
-      };
-      union data t;
-      t.bits = 0;
-      int i = 0;
-      while (CAN.available()) {
-        uint32_t j = CAN.read();
-        if(i < 4) {
-          t.bits = (t.bits << 8) + j;
-          // Serial.print(j,HEX);
-          // Serial.print(" ");
-          i++;
-        }
-      }
-      // Serial.println();
-      // Serial.print(t.number);
-      voltage = t.number;
-      // Serial.println();
-    }
-    // Serial.println();
+
+void canISR() {
+  if (CAN.checkReceive() == CAN_MSGAVAIL) {
+    CANMessage msg;
+    CAN.readMsgBuf(&msg.id, &msg.len, msg.buf);
+    int nextHead = (bufferHead + 1) % BUFFER_SIZE;
+    if (nextHead != bufferTail) {
+      canBuffer[bufferHead] = msg;
+      bufferHead = nextHead;
+    } 
   }
-  if(CAN.packetId() == 0x700) {
-    // Serial.print("Received ");
-    if (CAN.packetExtended()) {
-      // Serial.print("extended ");
-    }
-    if (CAN.packetRtr()) {
-      // Remote transmission request, packet contains no data
-      // Serial.print("RTR ");
-    }
-    // Serial.print("packet with id ");
-    // Serial.print(CAN.packetId());
-    //// Serial.print(CAN.packetId(), HEX);
-    if (CAN.packetRtr()) {
-      // Serial.print(" and requested length ");
-      // Serial.println(CAN.packetDlc());
-    } else {
-      // Serial.print(" and length ");
-      // Serial.println(packetSize);
-      // only print packet data for non-RTR packets
-      union data {
-        uint32_t bits;
-        float number;
-      };
-      union data t;
-      t.bits = 0;
-      int i = 0;
-      while (CAN.available()) {
-        uint32_t j = CAN.read();
-        if(i < 4) {
-          t.bits = (t.bits << 8) + j;
-          // Serial.print(j,HEX);
-          // Serial.print(" ");
-          i++;
-        }
-      }
-      // Serial.println();
-      // Serial.print(t.number);
-      coolTemp = t.number;
-      // Serial.println();
-    }
-    // Serial.println();
+}
+
+//-------------------SET VARIABLES FROM CAN PACKET-------------------------------------------
+void processCANMessages() {
+  while (bufferTail != bufferHead) {
+    CANMessage msg = canBuffer[bufferTail];
+    bufferTail = (bufferTail + 1) % BUFFER_SIZE;
+    handleCANMessage(msg);
   }
-  if(CAN.packetId() == 0x702) {
-    // Serial.print("Received ");
-    if (CAN.packetExtended()) {
-      // Serial.print("extended ");
-    }
-    if (CAN.packetRtr()) {
-      // Remote transmission request, packet contains no data
-      // Serial.print("RTR ");
-    }
-    // Serial.print("packet with id ");
-    // Serial.print(CAN.packetId());
-    //// Serial.print(CAN.packetId(), HEX);
-    if (CAN.packetRtr()) {
-      // Serial.print(" and requested length ");
-      // Serial.println(CAN.packetDlc());
-    } else {
-      // Serial.print(" and length ");
-      // Serial.println(packetSize);
-      // only print packet data for non-RTR packets
-      union data {
-        uint32_t bits;
-        float number;
-      };
-      union data t;
-      t.bits = 0;
-      int i = 0;
-      while (CAN.available()) {
-        uint32_t j = CAN.read();
-        if(i < 4) {
-          t.bits = (t.bits << 8) + j;
-          // Serial.print(j,HEX);
-          // Serial.print(" ");
-          i++;
-        }
-      }
-      // Serial.println();
-      // Serial.print(t.number);
-      engnSpeed = t.number / 6;
-      // Serial.println();
-    }
-    // Serial.println();
+}
+
+void handleCANMessage(CANMessage msg) {
+  switch (msg.id) {
+    case 0x102:
+      rpm = extractFloatFromBuffer(msg.buf) / 6;
+      gear = msg.buf[7];
+      break;
+    case 0x103:
+      coolInTemp = extractFloatFromBuffer(msg.buf);
+      coolOutTemp = extractFloatFromBuffer(msg.buf + 4);
+      break;
+    case 0x104:
+      batteryVoltage = extractFloatFromBuffer(msg.buf) * 100;
+      fuelUsed = extractFloatFromBuffer(msg.buf + 4) * 100;
+      break;
   }
-  if(CAN.packetId() == 0x703) {
-    // Serial.print("Received ");
-    if (CAN.packetExtended()) {
-      // Serial.print("extended ");
-    }
-    if (CAN.packetRtr()) {
-      // Remote transmission request, packet contains no data
-      // Serial.print("RTR ");
-    }
-    // Serial.print("packet with id ");
-    // Serial.print(CAN.packetId());
-    //// Serial.print(CAN.packetId(), HEX);
-    if (CAN.packetRtr()) {
-      // // Serial.print(" and requested length ");
-      // // Serial.println(CAN.packetDlc());
-    } else {
-      // // Serial.print(" and length ");
-      // // Serial.println(packetSize);
-      // only print packet data for non-RTR packets
-      union data {
-        uint32_t bits;
-        float number;
-      };
-      union data t;
-      t.bits = 0;
-      int i = 0;
-      while (CAN.available()) {
-        uint32_t j = CAN.read();
-        if(i < 4) {
-          t.bits = (t.bits << 8) + j;
-          // // Serial.print(j,HEX);
-          // // Serial.print(" ");
-          i++;
-        }
-      }
-      // // Serial.println();
-      // // Serial.print(t.number);
-      wheelSpeed = t.number;
-      // // Serial.println();
-    }
-    // // Serial.println();
+}
+
+float extractFloatFromBuffer(unsigned char* buf) {
+  union {
+    uint32_t bits;
+    float number;
+  } data;
+  data.bits = (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
+  return data.number;
+}
+
+//--------------------SENDING VALUES TO NEXTION---------------------------------------------
+void sendRPM() {
+  rpm3dig = rpm / 100;
+  if (rpm3dig <= 100) {
+    rpm1 = rpm3dig;
+    rpm2 = 0;
+  } else if (rpm3dig <= 135) {
+    rpm1 = 100;
+    rpm2 = (rpm3dig % 100) * 100 / 35;
+  } else {
+    rpm1 = 100;
+    rpm2 = 100;
   }
+  sendToNextion("rpm", rpm, true);
+  sendToNextion("rpm1", rpm1, true);
+  sendToNextion("rpm2", rpm2, true);
+}
+void sendCoolantTemp() {
+  sendToNextion("b3", coolInTemp, false);
+  sendToNextion("b4", coolOutTemp, false);
+  if (coolInTemp > 99.0) {
+    sendToNextion("a2", "OVERHEATING", false);
+    Serial1.print("warning.aph=127"); Serial1.write(0xFF); Serial1.write(0xFF); Serial1.write(0xFF);
+  } else { 
+    sendToNextion("a2", "", false);
+    Serial1.print("warning.aph=0"); Serial1.write(0xFF); Serial1.write(0xFF); Serial1.write(0xFF);
+  }
+}
+void sendBattery() {
+  sendToNextion("batteryVoltage", batteryVoltage, false);
+}
+void sendFuel() {
+  sendToNextion("c1", fuelUsed, false);
+}
+void sendGear() {
+  sendToNextion("gear", gear, true);
+}
+
+void sendToNextion(const String& objectName, const String& value, bool isNumeric) {
+  Serial1.print(objectName + (isNumeric ? ".val=" : ".txt=\"") + value + (isNumeric ? "" : "\""));
+  Serial1.write(0xFF);
+  Serial1.write(0xFF);
+  Serial1.write(0xFF);
 }
